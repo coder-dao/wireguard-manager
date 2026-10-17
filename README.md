@@ -29,16 +29,16 @@ Both `curl` commands must return public IP addresses. If IPv6 fails, enable its 
 
 ```bash
 ssh ubuntu@YOUR_VPS_IP
-curl -fsSLo wireguard-manager.sh https://raw.githubusercontent.com/coder-dao/wireguard-manager/main/wireguard-manager.sh
+curl -fsSLo wireguard-manager.sh https://raw.githubusercontent.com/coder-dao/wireguard-manager/refs/heads/main/wireguard-manager.sh
 sudo bash wireguard-manager.sh install
 ```
 
 **Option B — upload the v1 script from your computer:**
 
 ```bash
-scp wireguard-manager.sh ubuntu@YOUR_VPS_IP:~/
+scp wireguard-manager.sh ubuntu@YOUR_VPS_IP:/home
 ssh ubuntu@YOUR_VPS_IP
-sudo bash ~/wireguard-manager.sh install
+sudo bash wireguard-manager.sh install
 ```
 
 Replace `ubuntu` and `YOUR_VPS_IP` as needed. Confirm the **SSH port** and **VPN IPv4 subnet** (default `10.66.66.0/24`), then type `INSTALL`.
