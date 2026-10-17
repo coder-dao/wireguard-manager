@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 077
 
-VERSION=1
+VERSION=1.1
 PORT=443
 WG_DIR=/etc/wireguard
 WG_CONF=$WG_DIR/wg0.conf
@@ -25,6 +25,39 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 root_only() { (( EUID == 0 )) || fail 'Run with sudo.'; }
 valid_name() { [[ ${1:-} =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
+
+# Styling is intentionally optional: menus remain readable over basic SSH,
+# in logs, with NO_COLOR, and on terminals without ANSI color support.
+UI_BOLD='' UI_ACCENT='' UI_MUTED='' UI_RESET=''
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+  UI_BOLD=$'\033[1m'
+  UI_ACCENT=$'\033[36m'
+  UI_MUTED=$'\033[2m'
+  UI_RESET=$'\033[0m'
+fi
+
+# Put the result in REPLY so prompts do not get swallowed by $(...).
+ask_choice() {
+  local prompt=$1 default=$2 answer valid choice
+  shift 2
+  while true; do
+    printf '%s [%s]: ' "$prompt" "$default"
+    IFS= read -r answer || return 1
+    answer=${answer:-$default}
+    valid=0
+    for choice in "$@"; do
+      [[ $answer != "$choice" ]] || { valid=1; break; }
+    done
+    if (( valid )); then REPLY=$answer; return 0; fi
+    warn "Please enter one of: $*."
+  done
+}
+
+menu_header() {
+  printf '\n%s%sWireGuard Manager%s  %sv%s%s\n' "$UI_BOLD" "$UI_ACCENT" "$UI_RESET" "$UI_MUTED" "$VERSION" "$UI_RESET"
+  printf '%sDual-stack IPv4 + IPv6 VPN | Private Blocky DNS%s\n' "$UI_MUTED" "$UI_RESET"
+  printf '%s----------------------------------------------------%s\n' "$UI_MUTED" "$UI_RESET"
+}
 
 # Parse only the two addresses placed in wg0.conf by this version.
 load_network() {
@@ -611,8 +644,11 @@ EOF
   fi
   rm -f "$backup"
   say "Added $name ($mode, $ip4 + $ip6, $family endpoint)"
-  printf 'Profile: %s\nQR code: sudo wireguard-manager qr %s\n' "$CLIENT_DIR/$name.conf" "$name"
-  warn 'Protect the profile/QR: it contains a private key.'
+  printf 'Stored securely: %s\n' "$CLIENT_DIR/$name.conf"
+  printf 'Phone QR:      sudo wireguard-manager qr %s\n' "$name"
+  printf 'Copy/paste:    sudo wireguard-manager config %s\n' "$name"
+  printf 'Save .conf:    sudo wireguard-manager export %s\n' "$name"
+  warn 'Keep the profile, exported file, and QR private: all contain the device private key.'
   [[ $mode != full ]] || warn 'Enable the OS always-on VPN / block-without-VPN setting to stop traffic if the tunnel disconnects.'
 }
 
@@ -659,14 +695,99 @@ remove_device() {
   say "Revoked $name"
 }
 
-show_qr() {
+# Verify a device exists before displaying or exporting its secret profile.
+profile_path() {
   load_network
   local name=${1:-}
-  if [[ -z $name ]]; then list_devices; printf 'Device: '; read -r name; fi
-  valid_name "$name" || fail 'Invalid name.'
-  [[ -f $CLIENT_DIR/$name.conf ]] || fail 'No such device.'
-  warn 'This QR code reveals the private WireGuard key. Do not publish or screenshot it.'
-  qrencode -t ansiutf8 < "$CLIENT_DIR/$name.conf"
+  valid_name "$name" || fail 'Supply a valid device name (see: wireguard-manager list).'
+  [[ -f $CLIENT_DIR/$name.conf && ! -L $CLIENT_DIR/$name.conf ]] || fail "No profile found for device: $name"
+  PROFILE_PATH=$CLIENT_DIR/$name.conf
+}
+
+show_qr() {
+  local name=${1:-}
+  if [[ -z $name ]]; then list_devices; printf 'Device name: '; read -r name || return 1; fi
+  profile_path "$name"
+  warn 'This QR code contains a private key. Scan it only with your own device.'
+  qrencode -t ansiutf8 < "$PROFILE_PATH"
+}
+
+# Plain-text output is ONLY the WireGuard configuration, so users can copy it
+# or pipe it to other tools without a banner, ANSI colors, or a confirmation.
+show_config() {
+  local name=${1:-}
+  profile_path "$name"
+  warn 'This configuration contains a private key. Do not share or post it.'
+  cat -- "$PROFILE_PATH"
+}
+
+# Create a separate, owner-readable file without overwriting files or following
+# a destination symlink. When called via sudo, give the file to the SSH user so
+# it can be downloaded with scp without weakening /etc/wireguard permissions.
+export_profile() {
+  local name=${1:-} destination=${2:-}
+  profile_path "$name"
+  destination=${destination:-$PWD/$name.conf}
+  [[ -n $destination && $destination != *$'\n'* ]] || fail 'Invalid destination path.'
+  if ! python3 - "$PROFILE_PATH" "$destination" <<'PYEXPORT'
+import os
+import shutil
+import sys
+
+source, destination = sys.argv[1:]
+uid, gid = os.geteuid(), os.getegid()
+if os.geteuid() == 0 and 'SUDO_UID' in os.environ and 'SUDO_GID' in os.environ:
+    uid, gid = int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID'])
+
+# O_EXCL protects existing files (including symlinks), even under concurrency.
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+try:
+    fd = os.open(destination, flags, 0o600)
+except FileExistsError:
+    sys.exit(f'Refusing to overwrite existing file: {destination}')
+except OSError as e:
+    sys.exit(f'Cannot create export: {e}')
+try:
+    with os.fdopen(fd, 'wb') as output, open(source, 'rb') as source_file:
+        os.fchmod(output.fileno(), 0o600)
+        os.fchown(output.fileno(), uid, gid)
+        shutil.copyfileobj(source_file, output)
+except OSError as e:
+    sys.exit(f'Export failed: {e}. Check the destination for a partial file.')
+PYEXPORT
+  then
+    fail "Cannot export $name to $destination. No existing file was changed."
+  fi
+  say "Saved private WireGuard profile: $destination"
+  printf 'File permissions: owner read/write only (600).\n'
+  printf 'Download it securely with scp, then import the .conf in WireGuard.\n'
+  warn 'Keep the file out of Git repositories and shared folders; delete extra copies when finished.'
+}
+
+# A guided alternative to the three individual profile commands.
+get_device_config() {
+  local name=${1:-} destination
+  if [[ -z $name ]]; then
+    list_devices
+    printf '\nDevice name (or blank to go back): '
+    IFS= read -r name || return 0
+    [[ -n $name ]] || return 0
+  fi
+  profile_path "$name"
+  printf '\n%sGet configuration: %s%s\n' "$UI_BOLD" "$name" "$UI_RESET"
+  printf '  1  Show QR code          Phone or tablet camera\n'
+  printf '  2  Show configuration   Copy/paste into a WireGuard client or router\n'
+  printf '  3  Save .conf file      Import on a computer or router\n'
+  printf '  0  Back\n'
+  ask_choice 'Choose how to get the profile' 3 0 1 2 3 || return 0
+  case $REPLY in
+    1) show_qr "$name" ;;
+    2) printf '\n'; show_config "$name"; printf '\n' ;;
+    3) printf 'Save to path [%s/%s.conf]: ' "$PWD" "$name"
+       IFS= read -r destination || return 0
+       export_profile "$name" "${destination:-$PWD/$name.conf}" ;;
+    0) return 0 ;;
+  esac
 }
 
 status() {
@@ -694,33 +815,100 @@ status() {
   printf 'Client IP/DNS leak tests are required; see README.md.\n'
 }
 
+menu_add_device() {
+  local name mode family
+  printf '\n%sAdd a device%s\n' "$UI_BOLD" "$UI_RESET"
+  printf 'Examples: phone, laptop, home-router (lowercase, no spaces)\n'
+  printf 'Device name (blank to go back): '
+  IFS= read -r name || return 0
+  [[ -n $name ]] || return 0
+  printf '\nVPN traffic:\n'
+  printf '  1  Full VPN (recommended)   All internet, IPv4/IPv6 and DNS\n'
+  printf '  2  Private network only     Access VPN devices, normal internet stays local\n'
+  ask_choice 'Connection type' 1 1 2 || return 0
+  if [[ $REPLY == 1 ]]; then mode=full; else mode=private; fi
+  printf '\nServer connection (both still carry IPv4 + IPv6 inside the VPN):\n'
+  printf '  1  IPv4 endpoint (recommended)   Works on most networks\n'
+  printf '  2  IPv6 endpoint                 Requires client IPv6 connectivity\n'
+  ask_choice 'Endpoint' 1 1 2 || return 0
+  if [[ $REPLY == 1 ]]; then family=ipv4; else family=ipv6; fi
+  add_device "$name" "$mode" "$family"
+  printf '\nNow choose how to set it up on your device.\n'
+  get_device_config "$name"
+}
+
+print_help() {
+  cat <<'HELP'
+WireGuard Manager - dual-stack VPN and private DNS
+
+Usage:
+  sudo wireguard-manager                 Interactive menu (recommended)
+  sudo wireguard-manager get [NAME]      Choose QR / copy-paste / file export
+
+Device commands:
+  add NAME [full|private] [ipv4|ipv6]   Create a device (defaults: prompt/IPv4)
+  list                                  List configured devices
+  config NAME                           Print plain-text .conf for copy/paste
+  export NAME [FILE]                    Save .conf (default: ./NAME.conf)
+  qr NAME                               Show QR for a phone or tablet
+  remove NAME                           Revoke and delete a device (asks to confirm)
+
+Server commands:
+  install                                Install on a fresh Ubuntu 26.04 VPS
+  status                                 Check VPN, DNS, IPv4/IPv6 and firewall
+  dns                                    Reset Blocky configuration to defaults
+  --version                              Show version
+  --help                                 Show this help
+
+Examples:
+  sudo wireguard-manager add laptop full
+  sudo wireguard-manager config laptop
+  sudo wireguard-manager export laptop /home/ubuntu/laptop.conf
+  sudo wireguard-manager qr phone
+
+Security: Configurations and QR codes contain PRIVATE KEYS. Exported files use
+mode 600 and are owned by your sudo user (if any). Existing files are NOT
+replaced. Copy exported profiles securely, and delete unnecessary copies.
+HELP
+}
+
 menu() {
-  local opt name mode family
+  local opt
   while true; do
-    printf '\n=== WireGuard Manager v1 (IPv4 + IPv6) ===\n'
-    printf '1) Install  2) Add device  3) Remove device  4) List devices\n'
-    printf '5) Device QR  6) Status  7) Reset Blocky DNS  8) Exit\nChoice: '
-    read -r opt || break
+    menu_header
+    printf '\n%sDevices%s\n' "$UI_ACCENT" "$UI_RESET"
+    printf '  1  Add a new device\n'
+    printf '  2  List devices\n'
+    printf '  3  Get device configuration  (QR / copy / file)\n'
+    printf '  4  Remove a device\n'
+    printf '\n%sServer%s\n' "$UI_ACCENT" "$UI_RESET"
+    printf '  5  Check server status\n'
+    printf '  6  Reset Blocky DNS to defaults\n'
+    printf '  7  Install on a fresh VPS\n'
+    printf '\n  0  Exit\n\n'
+    ask_choice 'Your choice' 0 0 1 2 3 4 5 6 7 || return 0
+    opt=$REPLY
     case $opt in
-      1) install_server ;;
-      2) printf 'Device name: '; read -r name; printf 'Mode [full/private]: '; read -r mode
-         printf 'Endpoint family [ipv4/ipv6, default ipv4]: '; read -r family
-         add_device "$name" "$mode" "${family:-ipv4}" ;;
-      3) remove_device ;;
-      4) list_devices ;;
-      5) show_qr ;;
-      6) status ;;
-      7) reset_dns ;;
-      8) break ;;
-      *) warn 'Select 1-8.' ;;
+      1) menu_add_device ;;
+      2) list_devices ;;
+      3) get_device_config ;;
+      4) remove_device ;;
+      5) status ;;
+      6) printf '\nThis resets /etc/blocky/config.yml (including custom changes).\n'
+         ask_choice 'Reset DNS settings? (yes/no)' no yes no || continue
+         [[ $REPLY != yes ]] || reset_dns ;;
+      7) install_server ;;
+      0) return 0 ;;
     esac
+    printf '\nPress Enter to return to the menu...'
+    IFS= read -r _ || return 0
   done
 }
 
 main() {
   case ${1:-} in
     version|--version) printf 'wireguard-manager %s (IPv4 + IPv6; Blocky %s)\n' "$VERSION" "$BLOCKY_VERSION"; return 0 ;;
-    help|--help) printf 'Usage: sudo wireguard-manager [install|add NAME full|private [ipv4|ipv6]|remove NAME|list|qr NAME|status|dns|version]\n'; return 0 ;;
+    help|--help|-h) print_help; return 0 ;;
   esac
   root_only
   exec 9>/run/lock/wireguard-manager.lock
@@ -730,6 +918,9 @@ main() {
     add) add_device "${2:-}" "${3:-}" "${4:-ipv4}" ;;
     remove) remove_device "${2:-}" ;;
     list) list_devices ;;
+    get) get_device_config "${2:-}" ;;
+    config|show) show_config "${2:-}" ;;
+    export) export_profile "${2:-}" "${3:-}" ;;
     qr) show_qr "${2:-}" ;;
     status) status ;;
     dns) reset_dns ;;

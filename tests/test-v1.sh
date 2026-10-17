@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Non-root tests of v1 config generation and peer management (no VPS mutation).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# Works as tests/test-v1.sh in the repository or as a standalone copy.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+if [[ -f $script_dir/wireguard-manager.sh ]]; then
+  cd "$script_dir"
+else
+  cd "$script_dir/.."
+fi
 bash -n wireguard-manager.sh
 # shellcheck source=../wireguard-manager.sh
 source ./wireguard-manager.sh
@@ -67,4 +73,48 @@ if grep -q '^DNS = ' "$CLIENT_DIR/tablet.conf"; then echo 'Private mode wrongly 
 printf 'REMOVE\n' | remove_device tablet >/dev/null
 [[ ! -e $CLIENT_DIR/tablet.conf ]]
 [[ $(next_host) == 3 ]]
-printf 'All WireGuard Manager v1 local tests passed.\n'
+# Plain-text output must be byte-for-byte identical, with no banner or escape codes.
+show_config phone > "$tmp/show.conf" 2> "$tmp/show.err"
+cmp "$CLIENT_DIR/phone.conf" "$tmp/show.conf"
+grep -q 'private key' "$tmp/show.err"
+[[ $(stat -c %a "$CLIENT_DIR/phone.conf") == 600 ]]
+
+# Export should retain client material, use mode 600, and never overwrite files.
+export_profile phone "$tmp/exported.conf" >/dev/null 2> "$tmp/export.err"
+cmp "$CLIENT_DIR/phone.conf" "$tmp/exported.conf"
+[[ $(stat -c %a "$tmp/exported.conf") == 600 ]]
+if (export_profile phone "$tmp/exported.conf" >/dev/null 2>&1); then
+  echo 'Existing export was overwritten!' >&2; exit 1
+fi
+cmp "$CLIENT_DIR/phone.conf" "$tmp/exported.conf"
+printf 'sentinel\n' > "$tmp/important"
+ln -s "$tmp/important" "$tmp/symlink.conf"
+if (export_profile phone "$tmp/symlink.conf" >/dev/null 2>&1); then
+  echo 'Export followed a symlink!' >&2; exit 1
+fi
+[[ $(cat "$tmp/important") == sentinel ]]
+
+# Check default destination is the current directory.
+(cd "$tmp"; export_profile phone >/dev/null 2>&1)
+cmp "$CLIENT_DIR/phone.conf" "$tmp/phone.conf"
+[[ $(stat -c %a "$tmp/phone.conf") == 600 ]]
+
+# Guided config retrieval can show text or QR without writing to the VPS.
+config_view=$(printf '2\n' | get_device_config phone 2>/dev/null)
+[[ $config_view == *'[Interface]'* && $config_view == *'[Peer]'* ]]
+qrencode() { printf 'TEST_QR\n'; }
+qr_view=$(printf '1\n' | get_device_config phone 2>/dev/null)
+[[ $qr_view == *'TEST_QR'* ]]
+
+# The guided add-device flow maps numbered options to modes and endpoints.
+printf 'laptop\n1\n2\n0\n' | menu_add_device >/dev/null 2> "$tmp/add.err"
+grep -Fqx 'Endpoint = [2001:db8::10]:443' "$CLIENT_DIR/laptop.conf"
+grep -Fqx 'AllowedIPs = 0.0.0.0/0, ::/0' "$CLIENT_DIR/laptop.conf"
+
+# The menu and help should advertise config, export, and QR clearly.
+menu_text=$(printf '0\n' | menu)
+[[ $menu_text == *'Get device configuration  (QR / copy / file)'* ]]
+help_text=$(bash ./wireguard-manager.sh --help)
+[[ $help_text == *'config NAME'* && $help_text == *'export NAME'* && $help_text == *'get [NAME]'* ]]
+
+printf 'All WireGuard Manager v1.1 local tests passed.\n' 
