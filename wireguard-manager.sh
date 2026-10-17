@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# WireGuard Manager v1 -- dual-stack WireGuard and private Blocky DNS.
+# WireGuard Manager -- dual-stack WireGuard and private Blocky DNS.
 # Fresh Ubuntu 26.04 LTS installs only. No embedded credentials.
 set -euo pipefail
 umask 077
 
-VERSION=1.1
+VERSION=1.2
 PORT=443
 WG_DIR=/etc/wireguard
 WG_CONF=$WG_DIR/wg0.conf
 CLIENT_DIR=$WG_DIR/clients
 MANAGER=/usr/local/sbin/wireguard-manager
+# Updates affect only the management script, never VPN or DNS configuration.
+UPDATE_URL=https://raw.githubusercontent.com/coder-dao/wireguard-manager/refs/heads/main/wireguard-manager.sh
+UPDATE_BACKUPS=/var/backups/wireguard-manager
 BLOCKY_BIN=/usr/local/bin/blocky
 BLOCKY_CONF=/etc/blocky/config.yml
 BLOCKY_UNIT=/etc/systemd/system/blocky.service
@@ -499,7 +502,7 @@ install_server() {
   ipv6pub=$(public_ip 6)
   cat <<INFO
 
-WireGuard Manager v1 -- fresh dual-stack installation
+WireGuard Manager v$VERSION -- fresh dual-stack installation
   IPv4 VPN:       $VPN4_NET (DNS: $VPN4_SERVER)
   IPv6 VPN:       $VPN6_NET (DNS: $VPN6_SERVER)
   Public IPv4:    $ipv4pub (WAN $WAN4)
@@ -553,7 +556,7 @@ EOF
   install_blocky_unit
   reset_dns
   install -m 700 "${BASH_SOURCE[0]}" "$MANAGER"
-  say 'Dual-stack WireGuard Manager v1 installed'
+  say "Dual-stack WireGuard Manager v$VERSION installed"
   printf 'Add a device: sudo wireguard-manager add phone full\n'
   printf 'Check: sudo wireguard-manager status\n'
 }
@@ -792,7 +795,7 @@ get_device_config() {
 
 status() {
   load_network
-  say 'Dual-stack WireGuard Manager v1'
+  say "Dual-stack WireGuard Manager v$VERSION"
   printf 'VPN IPv4: %s | VPN IPv6: %s\n' "$VPN4_NET" "$VPN6_NET"
   printf 'Public IPv4 endpoint: %s:%s\n' "$(< "$WG_DIR/public-ipv4")" "$PORT"
   printf 'Public IPv6 endpoint: [%s]:%s\n' "$(< "$WG_DIR/public-ipv6")" "$PORT"
@@ -837,6 +840,122 @@ menu_add_device() {
   get_device_config "$name"
 }
 
+# Read (but do not execute) a candidate's version. Only accept our expected
+# script layout, then run Bash's syntax parser before considering an update.
+manager_script_version() {
+  local script=$1 found version
+  [[ -f $script && ! -L $script && -s $script ]] || return 1
+  [[ $(head -n 1 -- "$script") == '#!/usr/bin/env bash' ]] || return 1
+  grep -Fqx 'MANAGER=/usr/local/sbin/wireguard-manager' "$script" || return 1
+  grep -Fq '# WireGuard Manager' "$script" || return 1
+  grep -Fq 'main() {' "$script" || return 1
+  grep -Fq 'if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi' "$script" || return 1
+  found=$(grep -Ec '^VERSION=' "$script") || return 1
+  [[ $found == 1 ]] || return 1
+  version=$(sed -n 's/^VERSION=//p' "$script")
+  [[ $version =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || return 1
+  bash -n "$script" || return 1
+  printf '%s\n' "$version"
+}
+
+# Refuse downgrades (including 1.10 -> 1.9), while allowing changes within
+# a version when maintainers forget to increment VERSION.
+version_is_older() {
+  python3 - "$1" "$2" <<'PYVERSION'
+import sys
+current, offered = (tuple(map(int, x.split('.'))) for x in sys.argv[1:])
+size = max(len(current), len(offered))
+sys.exit(0 if offered + (0,) * (size-len(offered)) < current + (0,) * (size-len(current)) else 1)
+PYVERSION
+}
+
+# Executed as a subshell so temporary files are removed even if validation,
+# download, install, or confirmation fails. The main CLI's flock stays held.
+update_manager() (
+  local option=${1:-} download='' staged='' restored='' current offered
+  local backup='' manager_dir=${MANAGER%/*} checksum answer stamp
+  [[ -z $option || $option == --check || $option == --yes ]] ||
+    fail 'Usage: sudo wireguard-manager update [--check|--yes]'
+  [[ -f $MANAGER && ! -L $MANAGER ]] ||
+    fail "Installed manager not found as a regular file: $MANAGER"
+  [[ -d $manager_dir && ! -L $manager_dir ]] || fail 'Manager directory is unsafe or missing.'
+  command -v curl >/dev/null || fail 'curl is required to check for updates.'
+
+  current=$(manager_script_version "$MANAGER") || fail 'Cannot validate installed manager.'
+  download=$(mktemp "$manager_dir/.wgm-download.XXXXXXXX") || fail 'Cannot stage the download.'
+  trap 'rm -f -- "$download" "$staged" "$restored"' EXIT
+  say 'Checking GitHub for a WireGuard Manager update'
+  printf 'Source: %s\n' "$UPDATE_URL"
+  if ! curl --fail --silent --show-error --location --retry 2 \
+      --connect-timeout 10 --max-time 90 --proto '=https' --proto-redir '=https' \
+      --output "$download" "$UPDATE_URL"; then
+    fail 'Download failed. Installed manager has not been changed.'
+  fi
+  [[ -s $download && $(stat -c %s "$download") -le 524288 ]] ||
+    fail 'Unexpected download size. Installed manager has not been changed.'
+  offered=$(manager_script_version "$download") ||
+    fail 'Downloaded file is not a valid WireGuard Manager Bash script. No changes made.'
+  if version_is_older "$current" "$offered"; then
+    fail "Refusing to downgrade from v$current to v$offered."
+  fi
+  printf 'Installed: v%s\nAvailable: v%s\n' "$current" "$offered"
+  if cmp -s -- "$MANAGER" "$download"; then
+    printf 'Already up to date. No changes needed.\n'
+    return 0
+  fi
+  checksum=$(sha256sum "$download")
+  printf 'Downloaded SHA-256: %s\n' "${checksum%% *}"
+  if [[ $current == "$offered" ]]; then
+    warn 'The source has changed without a version increase. Review upstream changes before installing.'
+  fi
+  if [[ $option == --check ]]; then
+    printf 'An update is available. Run: sudo wireguard-manager update\n'
+    return 0
+  fi
+  if [[ $option != --yes ]]; then
+    printf '\nThis replaces ONLY %s. VPN, keys, DNS, and firewall stay untouched.\n' "$MANAGER"
+    printf 'Do you trust the GitHub source above? Install this update? [y/N]: '
+    IFS= read -r answer || answer=''
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || {
+      printf 'Update cancelled. Nothing changed.\n'; return 0;
+    }
+  fi
+
+  # Preserve a recovery copy, then replace by rename on the same filesystem.
+  # The script currently running continues safely using its already-open inode.
+  if (( EUID == 0 )); then
+    install -d -o root -g root -m 700 "$UPDATE_BACKUPS" || fail 'Cannot create backup directory.'
+  else
+    install -d -m 700 "$UPDATE_BACKUPS" || fail 'Cannot create backup directory.'
+  fi
+  [[ -d $UPDATE_BACKUPS && ! -L $UPDATE_BACKUPS ]] || fail 'Unsafe backup directory.'
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  backup=$(mktemp "$UPDATE_BACKUPS/wireguard-manager-v${current}-${stamp}.XXXXXXXX.bak") ||
+    fail 'Could not allocate a backup file.'
+  cp -p -- "$MANAGER" "$backup" || fail 'Could not back up installed manager.'
+  chmod 600 "$backup"
+  staged=$(mktemp "$manager_dir/.wgm-install.XXXXXXXX") || fail 'Cannot stage the update.'
+  install -m 700 -- "$download" "$staged" || fail 'Cannot prepare updated CLI.'
+  if (( EUID == 0 )); then chown root:root "$staged" || fail 'Cannot set manager ownership.'; fi
+  if ! mv -fT -- "$staged" "$MANAGER"; then
+    fail "Could not replace CLI. The backup is at: $backup"
+  fi
+  staged=''
+  if ! bash -n "$MANAGER" || [[ $(manager_script_version "$MANAGER" || true) != "$offered" ]]; then
+    warn 'Post-install validation failed. Restoring the previous CLI.'
+    restored=$(mktemp "$manager_dir/.wgm-restore.XXXXXXXX") || fail "Restore manually from $backup"
+    install -m 700 "$backup" "$restored" || fail "Restore manually from $backup"
+    if (( EUID == 0 )); then chown root:root "$restored" || fail "Restore manually from $backup"; fi
+    mv -fT -- "$restored" "$MANAGER" || fail "Restore manually from $backup"
+    restored=''
+    fail "Update rolled back. Backup retained at: $backup"
+  fi
+  say "WireGuard Manager updated: v$current -> v$offered"
+  printf 'Backup: %s\n' "$backup"
+  printf 'Next: sudo wireguard-manager --version\n'
+  printf 'VPN configuration and running services were not modified.\n'
+)
+
 print_help() {
   cat <<'HELP'
 WireGuard Manager - dual-stack VPN and private DNS
@@ -857,6 +976,9 @@ Server commands:
   install                                Install on a fresh Ubuntu 26.04 VPS
   status                                 Check VPN, DNS, IPv4/IPv6 and firewall
   dns                                    Reset Blocky configuration to defaults
+  update                                 Download, validate and install new manager
+  update --check                         Check for changes (no installation)
+  update --yes                           Apply update without confirmation
   --version                              Show version
   --help                                 Show this help
 
@@ -865,6 +987,12 @@ Examples:
   sudo wireguard-manager config laptop
   sudo wireguard-manager export laptop /home/ubuntu/laptop.conf
   sudo wireguard-manager qr phone
+  sudo wireguard-manager update --check
+  sudo wireguard-manager update
+
+Updates: Uses the trusted coder-dao/wireguard-manager GitHub main branch.
+Checks syntax, refuses downgrades, and saves a backup before replacing only
+/usr/local/sbin/wireguard-manager. No unattended scheduled updates are enabled.
 
 Security: Configurations and QR codes contain PRIVATE KEYS. Exported files use
 mode 600 and are owned by your sudo user (if any). Existing files are NOT
@@ -885,8 +1013,9 @@ menu() {
     printf '  5  Check server status\n'
     printf '  6  Reset Blocky DNS to defaults\n'
     printf '  7  Install on a fresh VPS\n'
+    printf '  8  Update WireGuard Manager   (from GitHub, backup first)\n'
     printf '\n  0  Exit\n\n'
-    ask_choice 'Your choice' 0 0 1 2 3 4 5 6 7 || return 0
+    ask_choice 'Your choice' 0 0 1 2 3 4 5 6 7 8 || return 0
     opt=$REPLY
     case $opt in
       1) menu_add_device ;;
@@ -898,6 +1027,7 @@ menu() {
          ask_choice 'Reset DNS settings? (yes/no)' no yes no || continue
          [[ $REPLY != yes ]] || reset_dns ;;
       7) install_server ;;
+      8) update_manager ;;
       0) return 0 ;;
     esac
     printf '\nPress Enter to return to the menu...'
@@ -924,6 +1054,8 @@ main() {
     qr) show_qr "${2:-}" ;;
     status) status ;;
     dns) reset_dns ;;
+    update) [[ $# -le 2 ]] || fail 'Usage: sudo wireguard-manager update [--check|--yes]'
+            update_manager "${2:-}" ;;
     menu) menu ;;
     *) fail 'Unknown command. Run wireguard-manager --help.' ;;
   esac

@@ -111,10 +111,84 @@ printf 'laptop\n1\n2\n0\n' | menu_add_device >/dev/null 2> "$tmp/add.err"
 grep -Fqx 'Endpoint = [2001:db8::10]:443' "$CLIENT_DIR/laptop.conf"
 grep -Fqx 'AllowedIPs = 0.0.0.0/0, ::/0' "$CLIENT_DIR/laptop.conf"
 
+# The updater only replaces its own CLI. Exercise it against a fake install
+# and a mocked network, without changing the real VPS or hitting GitHub.
+MANAGER="$tmp/bin/wireguard-manager"
+UPDATE_BACKUPS="$tmp/backups"
+mkdir -p "$tmp/bin"
+cp ./wireguard-manager.sh "$MANAGER"
+chmod 700 "$MANAGER"
+cp "$MANAGER" "$tmp/old-manager"
+cp "$MANAGER" "$tmp/remote-manager"
+sed -i 's/^VERSION=1\.2$/VERSION=1.3/' "$tmp/remote-manager"
+[[ $(manager_script_version "$tmp/remote-manager") == 1.3 ]]
+[[ $(manager_script_version "$MANAGER") == 1.2 ]]
+curl() {
+  local target='' arg
+  while (( $# )); do
+    arg=$1; shift
+    case $arg in
+      --output) target=$1; shift ;;
+    esac
+  done
+  [[ -n $target ]] || return 1
+  [[ ${MOCK_CURL_FAIL:-0} == 0 ]] || return 22
+  cp -- "$tmp/remote-manager" "$target"
+}
+
+# An available update is detectable without modifying the installed CLI.
+check_output=$(update_manager --check)
+[[ $check_output == *'Available: v1.3'* && $check_output == *'An update is available'* ]]
+cmp "$MANAGER" "$tmp/old-manager"
+[[ ! -d $UPDATE_BACKUPS ]]
+
+# Default is to reject an update unless the user explicitly consents.
+answer_output=$(printf 'n\n' | update_manager)
+[[ $answer_output == *'Update cancelled'* ]]
+cmp "$MANAGER" "$tmp/old-manager"
+
+# Noninteractive updates are explicitly opted into with --yes.
+update_manager --yes > "$tmp/update.log"
+[[ $(manager_script_version "$MANAGER") == 1.3 ]]
+[[ $(stat -c %a "$MANAGER") == 700 ]]
+cmp "$MANAGER" "$tmp/remote-manager"
+shopt -s nullglob
+backups=("$UPDATE_BACKUPS"/*.bak)
+[[ ${#backups[@]} == 1 ]]
+cmp "${backups[0]}" "$tmp/old-manager"
+[[ $(stat -c %a "${backups[0]}") == 600 ]]
+
+# Running update again against identical content is a no-op.
+update_manager --yes > "$tmp/noop.log"
+backups=("$UPDATE_BACKUPS"/*.bak)
+[[ ${#backups[@]} == 1 ]]
+
+# Reject older, broken, and failed downloads without touching the CLI.
+sed -i 's/^VERSION=1\.3$/VERSION=1.1/' "$tmp/remote-manager"
+if (update_manager --yes >/dev/null 2>&1); then
+  echo 'Updater accepted a downgrade!' >&2; exit 1
+fi
+cmp "$MANAGER" "$tmp/bin/wireguard-manager"
+sed -i 's/^VERSION=1\.1$/VERSION=1.4/' "$tmp/remote-manager"
+printf '\nif false; then\n' >> "$tmp/remote-manager"
+if (update_manager --yes >/dev/null 2>&1); then
+  echo 'Updater accepted invalid Bash syntax!' >&2; exit 1
+fi
+MOCK_CURL_FAIL=1
+if (update_manager --yes >/dev/null 2>&1); then
+  echo 'Updater accepted a failed download!' >&2; exit 1
+fi
+unset MOCK_CURL_FAIL
+[[ $(manager_script_version "$MANAGER") == 1.3 ]]
+backups=("$UPDATE_BACKUPS"/*.bak)
+[[ ${#backups[@]} == 1 ]]
+
 # The menu and help should advertise config, export, and QR clearly.
 menu_text=$(printf '0\n' | menu)
 [[ $menu_text == *'Get device configuration  (QR / copy / file)'* ]]
+[[ $menu_text == *'Update WireGuard Manager'* ]]
 help_text=$(bash ./wireguard-manager.sh --help)
 [[ $help_text == *'config NAME'* && $help_text == *'export NAME'* && $help_text == *'get [NAME]'* ]]
+[[ $help_text == *'update --check'* && $help_text == *'update --yes'* ]]
 
-printf 'All WireGuard Manager v1.1 local tests passed.\n' 
+printf 'All WireGuard Manager v1.2 local tests passed.\n' 

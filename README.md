@@ -4,7 +4,7 @@
 
 Simple interactive menus for adding devices, checking your VPN, and getting each device's WireGuard configuration. **Phones can scan a QR code; computers and routers can import a `.conf` file or copy/paste the plain-text configuration.** Command-line options are also available for scripting or experienced users.
 
-> **Fresh VPS installations only.** Requires working public IPv4 **and** IPv6. No migration or automated update command is included.
+> **Fresh VPS installations only.** Requires working public IPv4 **and** IPv6. Existing VPN installs can update the **manager CLI only** with the new `update` command; VPN migrations are not supported.
 
 ## 1. Requirements
 
@@ -54,7 +54,7 @@ sudo wireguard-manager
 ```
 
 ```text
-WireGuard Manager  v1.1
+WireGuard Manager  v1.2
 Dual-stack IPv4 + IPv6 VPN | Private Blocky DNS
 ----------------------------------------------------
 
@@ -68,6 +68,7 @@ Server
   5  Check server status
   6  Reset Blocky DNS to defaults
   7  Install on a fresh VPS
+  8  Update WireGuard Manager   (from GitHub, backup first)
 
   0  Exit
 
@@ -142,23 +143,26 @@ The `config` command prints the **complete, plain-text WireGuard profile**, incl
 
 ## 5. Everyday commands
 
-| What you want                     | Command                                                         |
-| --------------------------------- | --------------------------------------------------------------- |
-| Open the guided menu              | `sudo wireguard-manager`                                        |
-| Add a full-tunnel device          | `sudo wireguard-manager add laptop full`                        |
-| Add a private-only device         | `sudo wireguard-manager add pi private`                         |
-| Use an IPv6 server endpoint       | `sudo wireguard-manager add tablet full ipv6`                   |
-| List devices and VPN IP addresses | `sudo wireguard-manager list`                                   |
-| Choose QR / copy / file           | `sudo wireguard-manager get laptop`                             |
-| Copy/paste full configuration     | `sudo wireguard-manager config laptop`                          |
-| Export owner-only `.conf` file    | `sudo wireguard-manager export laptop`                          |
-| Export to a specific file         | `sudo wireguard-manager export laptop /home/ubuntu/laptop.conf` |
-| Show a device QR code             | `sudo wireguard-manager qr phone`                               |
-| Remove/revoke a device            | `sudo wireguard-manager remove laptop`                          |
-| Check VPN, DNS and firewall       | `sudo wireguard-manager status`                                 |
-| Reset Blocky DNS settings         | `sudo wireguard-manager dns`                                    |
-| Show friendly command help        | `wireguard-manager --help`                                      |
-| Show version                      | `wireguard-manager --version`                                   |
+| What you want                         | Command                                                         |
+| ------------------------------------- | --------------------------------------------------------------- |
+| Open the guided menu                  | `sudo wireguard-manager`                                        |
+| Add a full-tunnel device              | `sudo wireguard-manager add laptop full`                        |
+| Add a private-only device             | `sudo wireguard-manager add pi private`                         |
+| Use an IPv6 server endpoint           | `sudo wireguard-manager add tablet full ipv6`                   |
+| List devices and VPN IP addresses     | `sudo wireguard-manager list`                                   |
+| Choose QR / copy / file               | `sudo wireguard-manager get laptop`                             |
+| Copy/paste full configuration         | `sudo wireguard-manager config laptop`                          |
+| Export owner-only `.conf` file        | `sudo wireguard-manager export laptop`                          |
+| Export to a specific file             | `sudo wireguard-manager export laptop /home/ubuntu/laptop.conf` |
+| Show a device QR code                 | `sudo wireguard-manager qr phone`                               |
+| Remove/revoke a device                | `sudo wireguard-manager remove laptop`                          |
+| Check VPN, DNS and firewall           | `sudo wireguard-manager status`                                 |
+| Reset Blocky DNS settings             | `sudo wireguard-manager dns`                                    |
+| Check GitHub for a manager update     | `sudo wireguard-manager update --check`                         |
+| Update manager (asks before applying) | `sudo wireguard-manager update`                                 |
+| Update manager without prompting      | `sudo wireguard-manager update --yes`                           |
+| Show friendly command help            | `wireguard-manager --help`                                      |
+| Show version                          | `wireguard-manager --version`                                   |
 
 ### Full VPN vs private-only
 
@@ -174,7 +178,57 @@ By default, the **server endpoint uses public IPv4**, even though _both IPv4 and
 
 **Android:** For better disconnect protection, enable **Always-on VPN** and **Block connections without VPN** in system VPN settings. To use Blocky rather than another DNS provider, turn off Android **Private DNS** and browser **Secure DNS** overrides where applicable. Other platforms need an equivalent tested kill switch. A `full` profile alone **is not** a kill switch.
 
-## 6. Check VPN, IPv6 and DNS health
+## 6. Update the manager from the CLI
+
+After publishing a new version of `wireguard-manager.sh` to your own GitHub `main` branch, run **on the VPS**:
+
+```bash
+sudo wireguard-manager update --check  # Download and check without installing
+sudo wireguard-manager update          # Ask for confirmation, then update
+sudo wireguard-manager --version       # Verify the installed version
+```
+
+Or choose **`8` — Update WireGuard Manager** from `sudo wireguard-manager`. For an explicitly approved non-interactive CLI update, use `sudo wireguard-manager update --yes`. The updater fetches directly from this project’s published source:
+
+`https://raw.githubusercontent.com/coder-dao/wireguard-manager/refs/heads/main/wireguard-manager.sh`
+
+The updater downloads over HTTPS, checks that the file looks like this project, validates Bash syntax and its version number, refuses downgrades, shows the downloaded SHA-256 hash, and asks before installing unless you passed `--yes`. If the installed file and downloaded file are identical, it does nothing. An altered file with the **same version** is reported explicitly instead of being silently ignored.
+
+The old installed manager is saved under **`/var/backups/wireguard-manager/`** (root-only) before the new script replaces `/usr/local/sbin/wireguard-manager`. The replacement is staged alongside the installed executable in `/usr/local/sbin/` for a safer rename, with a post-install validation check and best-effort rollback. The command does **not** run a fresh VPN install, restart services, change firewall rules, modify Blocky settings, or change WireGuard profiles or keys. It updates only the CLI executable. **No automatic timer/cron job is installed.**
+
+**Trust notice:** This downloads a shell script from the repository's `main` branch to run as root. HTTPS, Bash syntax checks, and a displayed hash are safeguards against accidental corruption, **not proof that upstream code is trustworthy**. Review repository changes before approving, especially before using `--yes` in automation. The updater does not yet verify signed release artifacts.
+
+### Enable this command for the first time on an existing v1.1 VPS
+
+The v1.1 manager does not contain the `update` command yet. Once you push this updated v1.2 project to GitHub, run this **one-time CLI replacement** from the cloned repository on your VPS:
+
+```bash
+cd /home/wireguard-manager
+git pull --ff-only
+bash -n wireguard-manager.sh
+bash wireguard-manager.sh --version  # Must show 1.2
+
+# Save the old executable and copy v1.2 into place.
+sudo cp -p /usr/local/sbin/wireguard-manager /usr/local/sbin/wireguard-manager.pre-update.bak
+sudo install -o root -g root -m 700 \
+  /home/wireguard-manager/wireguard-manager.sh \
+  /usr/local/sbin/wireguard-manager
+
+sudo wireguard-manager --version
+sudo wireguard-manager update --check
+```
+
+From then on, use `sudo wireguard-manager update` whenever you publish a future version—there is no need to `git pull` again just to update the installed manager. **Do not run `sudo wireguard-manager install` to upgrade an existing server.**
+
+If a CLI update needs to be reversed, list saved copies with `sudo ls -lt /var/backups/wireguard-manager/` and restore a chosen known-good backup:
+
+```bash
+sudo install -o root -g root -m 700 \
+  /var/backups/wireguard-manager/YOUR_BACKUP_FILENAME.bak \
+  /usr/local/sbin/wireguard-manager
+```
+
+## 7. Check VPN, IPv6 and DNS health
 
 On the **VPS**:
 
@@ -199,21 +253,23 @@ UFW's `status` does **not** show custom NAT rules. To check forced DNS redirecti
 
 Browser- or app-specific DNS-over-HTTPS can bypass **Blocky filtering**, though it normally still travels inside an active full tunnel. Leak-check sites are helpful indicators, not proof that every app is leak-free.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
-| Problem                       | What to check                                                                                                               |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| IPv6 doesn't work             | VPS public IPv6 and default route; `curl -6fsS https://api6.ipify.org`                                                      |
-| No WireGuard handshake        | VPS provider firewall **UDP 443**, IPv4/IPv6 endpoint reachability, `sudo wg show`                                          |
-| DNS doesn't work              | `sudo wireguard-manager status` and `sudo journalctl -u blocky -n 80 --no-pager`                                            |
-| Locked out after enabling UFW | Provider console; inspect SSH firewall rules and `/etc/ufw/before.rules`, `/etc/ufw/before6.rules`                          |
-| DNS bypasses Blocky           | Disable app/browser secure DNS or Android Private DNS overrides as appropriate                                              |
-| Cannot download exported file | Save it into your SSH user's accessible home directory, check owner-only permissions, then use `scp` **from your computer** |
-| Export says file exists       | Existing files are intentionally protected: use another path or deliberately remove the previous exported copy              |
+| Problem                         | What to check                                                                                                                     |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| IPv6 doesn't work               | VPS public IPv6 and default route; `curl -6fsS https://api6.ipify.org`                                                            |
+| No WireGuard handshake          | VPS provider firewall **UDP 443**, IPv4/IPv6 endpoint reachability, `sudo wg show`                                                |
+| DNS doesn't work                | `sudo wireguard-manager status` and `sudo journalctl -u blocky -n 80 --no-pager`                                                  |
+| Locked out after enabling UFW   | Provider console; inspect SSH firewall rules and `/etc/ufw/before.rules`, `/etc/ufw/before6.rules`                                |
+| DNS bypasses Blocky             | Disable app/browser secure DNS or Android Private DNS overrides as appropriate                                                    |
+| Cannot download exported file   | Save it into your SSH user's accessible home directory, check owner-only permissions, then use `scp` **from your computer**       |
+| Export says file exists         | Existing files are intentionally protected: use another path or deliberately remove the previous exported copy                    |
+| Update reports an older version | Push the updated script to the correct GitHub `main` branch; the updater deliberately refuses downgrades                          |
+| Update reports invalid script   | Ensure GitHub `main` contains the correct complete Bash file, not a 404 page or other content; the installed CLI was not replaced |
 
 Profiles in `/etc/wireguard/clients/`, their exported copies, and QR codes **must stay private**. Blocky listens for DNS only on the VPN IPs; its API is local to `127.0.0.1:4000`. IPv6 uses NAT66 and needs a working public IPv6 VPS address, but no delegated prefix. The server's own DNS resolver is unchanged.
 
-## 8. Local tests
+## 9. Local tests
 
 From the repository root (Bash and Python 3 are required):
 
@@ -222,7 +278,7 @@ bash -n wireguard-manager.sh
 bash tests/test-v1.sh
 ```
 
-Local tests cover profile generation, peer management, private file export, and the new CLI. They do **not** replace end-to-end tests on a real VPS and client. There is still no automated update or migration command.
+Local tests cover profile generation, peer management, private file export, menu actions, and **mocked manager updates**, including checking, cancellation, backup, syntax rejection, download failure, downgrade rejection, and idempotence. They do **not** replace end-to-end tests on a real VPS and client. There is no VPN migration command and no unattended update scheduler.
 
 ### Official and upstream documentation
 
